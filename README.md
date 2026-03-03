@@ -94,6 +94,15 @@ python main.py --input "Lecture1.pptx" --deck "Biochem Week 1" --chapters
 python main.py --input "Lecture1.pptx" --deck "Biochem" --chunk-size 8 --overlap 2
 ```
 
+**Faster processing (parallel chunks):** By default the app runs 2 chunks at a time. To use one at a time (sequential) or more parallelism:
+
+```bash
+python main.py --input "Lecture1.pptx" --deck "Biochem" --workers 1   # sequential
+python main.py --input "Lecture1.pptx" --deck "Biochem" --workers 3 # 3 chunks in parallel
+```
+
+The Web UI uses 2 parallel chunks by default. If your PC struggles (e.g. Ollama runs out of memory), set `CONCURRENT_CHUNKS=1` in the environment before starting the app.
+
 ## Import into Anki
 
 1. Open [Anki](https://apps.ankiweb.net/) (free, cross-platform).

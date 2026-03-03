@@ -19,3 +19,6 @@ GEMINI_MODEL = "gemini-2.0-flash"
 
 # Parser
 MAX_RETRIES = 3
+
+# Parallel chunk processing (1 = sequential, 2+ = run N chunks at a time). Conservative default to avoid overloading Ollama/GPU.
+CONCURRENT_CHUNKS = 2

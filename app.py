@@ -11,7 +11,7 @@ import requests
 from flask import Flask, jsonify, render_template_string, request, send_file
 from werkzeug.utils import secure_filename
 
-from config import GEMINI_API_KEY, OLLAMA_MODEL, OLLAMA_URL
+from config import CONCURRENT_CHUNKS, GEMINI_API_KEY, OLLAMA_MODEL, OLLAMA_URL
 from main import process_file, sanitize_deck_name, SLIDE_EXTENSIONS
 
 app = Flask(__name__)
@@ -47,80 +47,254 @@ HTML = """<!DOCTYPE html>
   <title>Flashcard Generator</title>
   <style>
     * { box-sizing: border-box; }
-    body { font-family: system-ui, -apple-system, sans-serif; max-width: 520px; margin: 2rem auto; padding: 0 1rem; color: #1a1a1a; }
-    h1 { font-size: 1.35rem; font-weight: 600; margin-bottom: 0.5rem; }
-    .sub { color: #666; font-size: 0.9rem; margin-bottom: 1.5rem; }
-    label { display: block; font-weight: 500; margin-bottom: 0.35rem; font-size: 0.9rem; }
-    input[type="text"], select { width: 100%; padding: 0.5rem 0.6rem; margin-bottom: 1rem; border: 1px solid #ccc; border-radius: 6px; font-size: 1rem; }
-    input[type="file"] { width: 100%; margin-bottom: 1rem; font-size: 0.9rem; }
-    button { width: 100%; padding: 0.65rem 1rem; font-size: 1rem; font-weight: 500; border: none; border-radius: 6px; background: #2563eb; color: white; cursor: pointer; }
-    button:hover { background: #1d4ed8; }
-    button:disabled { background: #94a3b8; cursor: not-allowed; }
-    .cancel-btn { width: auto; padding: 0.4rem 0.8rem; font-size: 0.9rem; background: #64748b; }
-    .cancel-btn:hover { background: #475569; }
-    .progress { margin-top: 1.25rem; padding: 1rem; background: #f1f5f9; border-radius: 8px; font-size: 0.9rem; display: none; }
+    body {
+      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+      max-width: 560px;
+      margin: 0 auto;
+      padding: 2rem 1.25rem 3rem;
+      color: #1e293b;
+      background: linear-gradient(180deg, #f8fafc 0%, #f1f5f9 100%);
+      min-height: 100vh;
+    }
+    .card {
+      background: #fff;
+      border-radius: 12px;
+      padding: 1.5rem 1.75rem;
+      margin-bottom: 1.25rem;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+      border: 1px solid #e2e8f0;
+    }
+    h1 {
+      font-size: 1.5rem;
+      font-weight: 700;
+      margin: 0 0 0.25rem 0;
+      color: #0f172a;
+      letter-spacing: -0.02em;
+    }
+    .sub {
+      color: #64748b;
+      font-size: 0.9rem;
+      margin: 0 0 1.5rem 0;
+      line-height: 1.5;
+    }
+    .sub a { color: #2563eb; text-decoration: none; }
+    .sub a:hover { text-decoration: underline; }
+    label {
+      display: block;
+      font-weight: 600;
+      margin-bottom: 0.4rem;
+      font-size: 0.875rem;
+      color: #334155;
+    }
+    input[type="text"], select {
+      width: 100%;
+      padding: 0.55rem 0.75rem;
+      margin-bottom: 1rem;
+      border: 1px solid #cbd5e1;
+      border-radius: 8px;
+      font-size: 0.95rem;
+      background: #fff;
+      color: #1e293b;
+    }
+    input[type="text"]:focus, select:focus {
+      outline: none;
+      border-color: #2563eb;
+      box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.15);
+    }
+    input[type="file"] {
+      width: 100%;
+      margin-bottom: 0.5rem;
+      font-size: 0.9rem;
+      padding: 0.5rem 0;
+    }
+    .hint {
+      margin: -0.5rem 0 1rem 0;
+      font-size: 0.8rem;
+      color: #64748b;
+    }
+    .row { display: flex; gap: 1rem; align-items: flex-start; flex-wrap: wrap; }
+    .row > * { flex: 1 1 auto; min-width: 0; }
+    .checkbox-row {
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+      margin-bottom: 1rem;
+    }
+    .checkbox-row input { width: auto; margin: 0; }
+    .checkbox-row span { font-weight: 500; font-size: 0.9rem; color: #334155; }
+    button[type="submit"] {
+      width: 100%;
+      padding: 0.75rem 1.25rem;
+      font-size: 1rem;
+      font-weight: 600;
+      border: none;
+      border-radius: 8px;
+      background: linear-gradient(180deg, #2563eb 0%, #1d4ed8 100%);
+      color: white;
+      cursor: pointer;
+      box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+    }
+    button[type="submit"]:hover { background: linear-gradient(180deg, #1d4ed8 0%, #1e40af 100%); }
+    button[type="submit"]:disabled { background: #94a3b8; cursor: not-allowed; box-shadow: none; }
+    .progress {
+      margin-top: 0;
+      padding: 1.25rem;
+      background: #f8fafc;
+      border-radius: 10px;
+      font-size: 0.9rem;
+      display: none;
+      border: 1px solid #e2e8f0;
+    }
     .progress.visible { display: block; }
-    .progress .phase { font-weight: 500; color: #334155; }
-    .progress .detail { color: #64748b; margin-top: 0.25rem; }
-    .progress .eta { font-size: 0.85rem; color: #64748b; margin-top: 0.2rem; }
-    .progress .bar { margin-top: 0.5rem; height: 6px; background: #e2e8f0; border-radius: 3px; overflow: hidden; }
-    .progress .bar-fill { height: 100%; background: #2563eb; border-radius: 3px; transition: width 0.2s; }
-    .progress.error .phase { color: #b91c1c; }
-    .progress.error .detail { color: #991b1b; }
-    .download { margin-top: 1rem; display: none; }
+    .progress .phase { font-weight: 600; color: #334155; font-size: 0.95rem; }
+    .progress .detail { color: #64748b; margin-top: 0.2rem; }
+    .progress .eta { font-size: 0.82rem; color: #64748b; margin-top: 0.25rem; }
+    .progress .bar {
+      margin-top: 0.75rem;
+      height: 8px;
+      background: #e2e8f0;
+      border-radius: 4px;
+      overflow: hidden;
+    }
+    .progress .bar-fill {
+      height: 100%;
+      background: linear-gradient(90deg, #2563eb, #3b82f6);
+      border-radius: 4px;
+      transition: width 0.25s ease;
+    }
+    .progress.error .phase { color: #dc2626; }
+    .progress.error .detail { color: #b91c1c; }
+    .cancel-btn {
+      width: auto;
+      padding: 0.45rem 1rem;
+      font-size: 0.875rem;
+      font-weight: 500;
+      margin-top: 0.75rem;
+      background: #64748b;
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+    .cancel-btn:hover { background: #475569; }
+    .download {
+      margin-top: 0;
+      display: none;
+      padding: 1.25rem;
+      background: #f0fdf4;
+      border-radius: 10px;
+      border: 1px solid #bbf7d0;
+    }
     .download.visible { display: block; }
-    .download a { display: inline-block; padding: 0.5rem 1rem; background: #059669; color: white; text-decoration: none; border-radius: 6px; font-weight: 500; }
-    .download a:hover { background: #047857; }
-    .status { margin-top: 0.5rem; font-size: 0.85rem; color: #64748b; }
-    .hint code { background: #e2e8f0; padding: 0.1rem 0.35rem; border-radius: 4px; font-size: 0.85em; }
+    .download p:first-child { font-weight: 600; color: #166534; margin: 0 0 0.75rem 0; }
+    .download a {
+      display: inline-block;
+      padding: 0.5rem 1rem;
+      background: #16a34a;
+      color: white;
+      text-decoration: none;
+      border-radius: 6px;
+      font-weight: 500;
+      font-size: 0.9rem;
+      margin-right: 0.5rem;
+      margin-bottom: 0.5rem;
+    }
+    .download a:hover { background: #15803d; }
+    .download .hint { margin-top: 0.75rem; margin-bottom: 0; }
+    .log-section {
+      margin-top: 1.5rem;
+      background: #1e293b;
+      border-radius: 10px;
+      overflow: hidden;
+      border: 1px solid #334155;
+    }
+    .log-header {
+      padding: 0.5rem 0.75rem;
+      font-size: 0.75rem;
+      font-weight: 600;
+      color: #94a3b8;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      background: #0f172a;
+      border-bottom: 1px solid #334155;
+    }
+    .log-content {
+      padding: 0.75rem 1rem;
+      font-family: 'Consolas', 'Monaco', monospace;
+      font-size: 0.8rem;
+      line-height: 1.5;
+      color: #e2e8f0;
+      max-height: 200px;
+      overflow-y: auto;
+    }
+    .log-line { margin-bottom: 0.2rem; }
+    .log-line.time { color: #64748b; font-size: 0.75rem; }
+    .log-line.msg { color: #cbd5e1; }
+    .log-line.err { color: #fca5a5; }
+    .log-line.done { color: #86efac; }
   </style>
 </head>
 <body>
-  <h1>Flashcard Generator</h1>
-  <p class="sub">Upload slides (PPTX or PDF) and get a flashcard deck. Use with Anki or <a href="https://knowt.com" target="_blank" rel="noopener">Knowt</a> (free learn mode).</p>
+  <div class="card">
+    <h1>Flashcard Generator</h1>
+    <p class="sub">Upload slides (PPTX or PDF) and get an Anki or <a href="https://knowt.com" target="_blank" rel="noopener">Knowt</a> deck. Uses cognitive principles for better recall.</p>
 
-  <form id="form">
-    <label for="file">Slide deck</label>
-    <input type="file" id="file" name="file" accept=".pptx,.pdf" required>
-    <p class="hint" style="margin: -0.5rem 0 1rem 0; font-size: 0.85rem; color: #64748b;">PPTX or PDF only.</p>
+    <form id="form">
+      <label for="file">Slide deck</label>
+      <input type="file" id="file" name="file" accept=".pptx,.pdf" required>
+      <p class="hint">PPTX or PDF only.</p>
 
-    <label for="deck">Deck name <span style="font-weight: normal; color: #64748b;">(optional)</span></label>
-    <input type="text" id="deck" name="deck" placeholder="Leave blank to use file name">
+      <label for="deck">Deck name</label>
+      <input type="text" id="deck" name="deck" placeholder="Leave blank to use file name">
 
-    <label for="provider">AI provider</label>
-    <select id="provider" name="provider">
-      <option value="ollama" selected>Ollama — free, runs on your PC</option>
-      <option value="gemini">Gemini — needs API key</option>
-    </select>
-    <p class="hint" style="margin: -0.5rem 0 1rem 0; font-size: 0.85rem; color: #64748b;">Default: Ollama. Start the Ollama app first if you use it.</p>
+      <label for="provider">AI provider</label>
+      <select id="provider" name="provider">
+        <option value="ollama" selected>Ollama — free, local</option>
+        <option value="gemini">Gemini — API key</option>
+      </select>
+      <p class="hint">Start the Ollama app first if you use it.</p>
 
-    <label for="ollamaModel" id="ollamaModelLabel" style="display: block;">Ollama model</label>
-    <select id="ollamaModel" name="ollama_model" style="display: block;">
-      <option value="" data-default="1">Loading…</option>
-    </select>
-    <p class="hint" id="ollamaModelHint" style="margin: -0.5rem 0 1rem 0; font-size: 0.85rem; color: #64748b; display: block;">Only used when provider is Ollama.</p>
+      <label for="ollamaModel" id="ollamaModelLabel">Ollama model</label>
+      <select id="ollamaModel" name="ollama_model">
+        <option value="">Loading…</option>
+      </select>
+      <p class="hint" id="ollamaModelHint">Only when provider is Ollama.</p>
 
-    <label style="display: flex; align-items: center; gap: 0.5rem; margin-bottom: 1rem;">
-      <input type="checkbox" id="useChapters" name="use_chapters" value="1">
-      <span>Use chapter detection (PPTX only: sections/headings → subdecks)</span>
-    </label>
+      <label for="workers">Parallel chunks</label>
+      <select id="workers" name="workers">
+        <option value="1">1 (sequential)</option>
+        <option value="2" selected>2 (faster)</option>
+        <option value="3">3</option>
+      </select>
+      <p class="hint">More chunks in parallel = faster, but more load on your PC.</p>
 
-    <button type="submit" id="submit">Generate deck</button>
-  </form>
+      <div class="checkbox-row">
+        <input type="checkbox" id="useChapters" name="use_chapters" value="1">
+        <span>Use chapter detection (PPTX only → subdecks)</span>
+      </div>
 
-  <div id="progress" class="progress">
-    <div class="phase" id="phase">—</div>
-    <div class="detail" id="detail"></div>
-    <div class="eta" id="eta"></div>
-    <div class="bar"><div class="bar-fill" id="barFill" style="width: 0%"></div></div>
-    <button type="button" id="cancelBtn" class="cancel-btn" style="display: none; margin-top: 0.5rem;">Cancel</button>
+      <button type="submit" id="submit">Generate deck</button>
+    </form>
+
+    <div id="progress" class="progress">
+      <div class="phase" id="phase">—</div>
+      <div class="detail" id="detail"></div>
+      <div class="eta" id="eta"></div>
+      <div class="bar"><div class="bar-fill" id="barFill" style="width: 0%"></div></div>
+      <button type="button" id="cancelBtn" class="cancel-btn">Cancel</button>
+    </div>
+
+    <div id="download" class="download">
+      <p>Your deck is ready.</p>
+      <a id="downloadAnki" href="#">Download for Anki (.apkg)</a>
+      <a id="downloadKnowt" href="#">Download for Knowt (.csv)</a>
+      <p class="hint">Downloads are kept for 10 minutes; save the files locally.</p>
+    </div>
   </div>
 
-  <div id="download" class="download">
-    <p style="margin-bottom: 0.5rem; font-weight: 500;">Your deck is ready.</p>
-    <a id="downloadAnki" href="#">Download for Anki (.apkg)</a>
-    <a id="downloadKnowt" href="#" style="margin-left: 0.5rem;">Download for Knowt (.csv)</a>
-    <p class="hint" style="margin-top: 0.5rem; font-size: 0.85rem; color: #64748b;">Downloads are kept for 10 minutes; save the files locally.</p>
+  <div class="log-section">
+    <div class="log-header">Log</div>
+    <div id="logContent" class="log-content"></div>
   </div>
 
   <script>
@@ -140,6 +314,21 @@ HTML = """<!DOCTYPE html>
     const ollamaModelHint = document.getElementById('ollamaModelHint');
     const phaseLabels = { extracting: 'Reading slides', chunking: 'Preparing content', generating: 'Generating cards', exporting: 'Building deck', exporting_subdecks: 'Building subdecks', done: 'Done', error: 'Error', starting: 'Starting...' };
     let etaStartTime = null;
+    const logContent = document.getElementById('logContent');
+    let lastLogKey = '';
+
+    function logMsg(text, type) {
+      const line = document.createElement('div');
+      line.className = 'log-line ' + (type || 'msg');
+      const time = new Date().toLocaleTimeString('en-GB', { hour12: false });
+      line.innerHTML = '<span class="time">[' + time + ']</span> ' + (text || '').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      logContent.appendChild(line);
+      logContent.scrollTop = logContent.scrollHeight;
+    }
+    function logClear() {
+      logContent.innerHTML = '';
+      lastLogKey = '';
+    }
 
     function setOllamaModelVisible(visible) {
       ollamaModelLabel.style.display = visible ? 'block' : 'none';
@@ -149,6 +338,7 @@ HTML = """<!DOCTYPE html>
     function setCancelVisible(visible) {
       cancelBtn.style.display = visible ? 'block' : 'none';
     }
+    cancelBtn.style.display = 'none';
 
     function showProgress(phase, message, current, total, isError) {
       progressEl.classList.add('visible');
@@ -209,17 +399,24 @@ HTML = """<!DOCTYPE html>
       progressEl.classList.remove('visible');
       downloadEl.classList.remove('visible');
       setCancelVisible(true);
+      logClear();
+      logMsg('Uploading...', 'msg');
       showProgress('Uploading...', '', 0, 0);
+
+      const workers = document.getElementById('workers').value || '2';
+      formData.append('workers', workers);
 
       const r = await fetch('/generate', { method: 'POST', body: formData });
       const data = await r.json();
       if (!r.ok) {
+        logMsg('Error: ' + (data.error || 'Upload failed'), 'err');
         showProgress('Error', data.error || 'Upload failed', null, null, true);
         submitBtn.disabled = false;
         return;
       }
 
       currentJobId = data.job_id;
+      logMsg('Job started. Polling status...', 'msg');
 
       const poll = setInterval(async () => {
         const s = await fetch('/status/' + currentJobId);
@@ -229,6 +426,15 @@ HTML = """<!DOCTYPE html>
         const current = sdata.current;
         const total = sdata.total;
         const isError = sdata.phase === 'error';
+        const logKey = phase + '|' + message + '|' + (current || '') + '|' + (total || '');
+        if (logKey !== lastLogKey) {
+          lastLogKey = logKey;
+          const phaseLabel = phaseLabels[phase] || phase;
+          const detail = message ? (phaseLabel + ' — ' + message) : phaseLabel;
+          if (sdata.phase === 'error') logMsg(detail, 'err');
+          else if (sdata.phase === 'done') logMsg('Done. ' + (message || 'Deck ready.'), 'done');
+          else logMsg(detail, 'msg');
+        }
         showProgress(phase, message, current, total, isError);
 
         if (sdata.phase === 'done') {
@@ -243,6 +449,7 @@ HTML = """<!DOCTYPE html>
         }
       }, 600);
     });
+    logMsg('Ready. Upload a file and click Generate deck.', 'msg');
 
     (async function loadOllamaModels() {
       try {
@@ -286,7 +493,7 @@ HTML = """<!DOCTYPE html>
 """
 
 
-def run_job(job_id: str, input_path: Path, deck_name: str, provider: str, out_path: Path, out_csv_path: Path, use_chapters: bool = False, model: str | None = None):
+def run_job(job_id: str, input_path: Path, deck_name: str, provider: str, out_path: Path, out_csv_path: Path, use_chapters: bool = False, model: str | None = None, workers: int = CONCURRENT_CHUNKS):
     cancel_check = lambda: _is_cancelled(job_id)
     def callback(phase=None, message=None, current=None, total=None, error=None, **kwargs):
         with _jobs_lock:
@@ -308,6 +515,7 @@ def run_job(job_id: str, input_path: Path, deck_name: str, provider: str, out_pa
             use_chapters=use_chapters,
             cancel_check=cancel_check,
             model=model if provider == "ollama" else None,
+            workers=workers,
         )
         with _jobs_lock:
             if job_id in jobs:
@@ -381,6 +589,11 @@ def generate():
     provider = request.form.get("provider") or "ollama"
     use_chapters = (request.form.get("use_chapters") or "").strip() == "1"
     ollama_model = (request.form.get("ollama_model") or "").strip() or None
+    try:
+        workers = int((request.form.get("workers") or "").strip() or CONCURRENT_CHUNKS)
+        workers = max(1, min(4, workers))
+    except (TypeError, ValueError):
+        workers = CONCURRENT_CHUNKS
     if provider == "gemini" and not GEMINI_API_KEY:
         return jsonify({"error": "GEMINI_API_KEY not set. Use Ollama or set the key."}), 400
 
@@ -406,7 +619,7 @@ def generate():
             "tmp": tmp,
             "cancelled": False,
         }
-    t = threading.Thread(target=run_job, args=(job_id, input_path, deck_name, provider, out_path, out_csv_path, use_chapters, ollama_model))
+    t = threading.Thread(target=run_job, args=(job_id, input_path, deck_name, provider, out_path, out_csv_path, use_chapters, ollama_model, workers))
     t.daemon = True
     t.start()
     return jsonify({"job_id": job_id})

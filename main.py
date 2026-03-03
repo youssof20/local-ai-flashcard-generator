@@ -4,6 +4,7 @@
 import argparse
 import re
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable
 
@@ -11,7 +12,7 @@ from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from chunker import chunk
-from config import CHUNK_OVERLAP, CHUNK_SIZE, GEMINI_API_KEY, MAX_RETRIES
+from config import CHUNK_OVERLAP, CHUNK_SIZE, CONCURRENT_CHUNKS, GEMINI_API_KEY, MAX_RETRIES
 from exporter import build_deck, build_decks_by_chapter, write_apkg, write_apkg_multi, write_csv
 from extractor import extract, extract_pptx_with_chapters
 from generator import generate
@@ -34,6 +35,46 @@ def get_unit_name(path: Path) -> str:
     return "pages" if path.suffix.lower() == ".pdf" else "slides"
 
 
+def _process_one_chunk(
+    args: tuple[int, str, int, int, str, str, str | None],
+) -> tuple[int, list[dict], str]:
+    """Process a single chunk: generate, parse, return (chunk_index, cards, source_label). Used for parallel flat flow."""
+    i, chunk_text, first_idx, last_idx, unit_name, provider, model = args
+    raw = None
+    last_error = None
+    for _ in range(MAX_RETRIES):
+        try:
+            raw = generate(chunk_text, provider=provider, model=model)
+            break
+        except Exception as e:
+            last_error = e
+    if raw is None:
+        raise RuntimeError(f"Chunk {i + 1} failed after {MAX_RETRIES} attempts: {last_error}") from last_error
+    cards = parse_cards(raw)
+    source_label = f"Source: {unit_name.capitalize()}s {first_idx}–{last_idx}"
+    return (i, cards, source_label)
+
+
+def _process_one_chunk_chapter(
+    args: tuple[int, str, str, int, int, str, str, str | None],
+) -> tuple[int, str, list[dict], str]:
+    """Process a single chunk in chapter mode. Returns (chunk_index, chapter_name, cards, source_label)."""
+    chunk_count, chapter_name, chunk_text, first_idx, last_idx, unit_name, provider, model = args
+    raw = None
+    last_error = None
+    for _ in range(MAX_RETRIES):
+        try:
+            raw = generate(chunk_text, provider=provider, model=model)
+            break
+        except Exception as e:
+            last_error = e
+    if raw is None:
+        raise RuntimeError(f"Chunk failed after {MAX_RETRIES} attempts: {last_error}") from last_error
+    cards = parse_cards(raw)
+    source_label = f"Source: {unit_name.capitalize()}s {first_idx}–{last_idx}"
+    return (chunk_count, chapter_name, cards, source_label)
+
+
 def process_file(
     input_path: Path,
     deck_name: str,
@@ -46,6 +87,7 @@ def process_file(
     overlap: int = CHUNK_OVERLAP,
     cancel_check: Callable[[], bool] | None = None,
     model: str | None = None,
+    workers: int = CONCURRENT_CHUNKS,
 ) -> tuple[Path, Path | None]:
     """
     Extract, chunk, generate, parse, export for one file.
@@ -67,29 +109,65 @@ def process_file(
         if not chapters:
             console.print(f"[yellow]No content from {input_path}. Skipping.[/yellow]")
             raise ValueError("No content")
-        all_cards: list[dict] = []
-        total_chunks = sum(
-            len(chunk(items, deck_name, unit_name=unit_name, chunk_size=chunk_size, overlap=overlap))
-            for _, items in chapters
-        )
+        all_cards = []
+        # Build flat list of (chunk_count, chapter_name, chunk_text, first_idx, last_idx)
+        chapter_tasks: list[tuple[int, str, str, int, int]] = []
         chunk_count = 0
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            console=console,
-        ) as progress:
-            task = progress.add_task("Generating cards...", total=total_chunks)
-            for chapter_name, items in chapters:
-                chunks_list = chunk(items, deck_name, unit_name=unit_name, chunk_size=chunk_size, overlap=overlap)
-                if not chunks_list:
-                    continue
-                for i, (chunk_text, first_idx, last_idx) in enumerate(chunks_list):
+        for chapter_name, items in chapters:
+            chunks_list = chunk(items, deck_name, unit_name=unit_name, chunk_size=chunk_size, overlap=overlap)
+            if not chunks_list:
+                continue
+            for chunk_text, first_idx, last_idx in chunks_list:
+                chapter_tasks.append((chunk_count, chapter_name, chunk_text, first_idx, last_idx))
+                chunk_count += 1
+        total_chunks = len(chapter_tasks)
+        use_parallel = workers >= 2 and total_chunks >= 2
+
+        if use_parallel:
+            chunk_args = [
+                (cc, ch_name, ct, fi, la, unit_name, provider, model)
+                for cc, ch_name, ct, fi, la in chapter_tasks
+            ]
+            completed = 0
+            results_by_index: dict[int, tuple[str, list[dict], str]] = {}
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = {executor.submit(_process_one_chunk_chapter, a): a[0] for a in chunk_args}
+                try:
+                    for future in as_completed(futures):
+                        if cancel_check and cancel_check():
+                            report("error", error="Cancelled")
+                            for f in futures:
+                                f.cancel()
+                            raise RuntimeError("Job cancelled") from None
+                        cc, chapter_name, cards, source_label = future.result()
+                        results_by_index[cc] = (chapter_name, cards, source_label)
+                        completed += 1
+                        report("generating", f"Chunk {completed}/{total_chunks}", current=completed, total=total_chunks)
+                except Exception:
+                    for f in futures:
+                        f.cancel()
+                    raise
+            for i in range(total_chunks):
+                if i in results_by_index:
+                    chapter_name, cards, source_label = results_by_index[i]
+                    for c in cards:
+                        c["chunk_index"] = i
+                        c["source"] = source_label
+                        c["chapter"] = chapter_name
+                    all_cards.extend(cards)
+        else:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                console=console,
+            ) as progress:
+                task = progress.add_task("Generating cards...", total=total_chunks)
+                for chunk_count, chapter_name, chunk_text, first_idx, last_idx in chapter_tasks:
                     if cancel_check and cancel_check():
                         report("error", error="Cancelled")
                         raise RuntimeError("Job cancelled") from None
-                    chunk_count += 1
-                    report("generating", f"Chunk {chunk_count}/{total_chunks}", current=chunk_count, total=total_chunks)
-                    progress.update(task, description=f"Chunk {chunk_count}/{total_chunks}")
+                    report("generating", f"Chunk {chunk_count + 1}/{total_chunks}", current=chunk_count + 1, total=total_chunks)
+                    progress.update(task, description=f"Chunk {chunk_count + 1}/{total_chunks}")
                     raw = None
                     last_error = None
                     for attempt in range(MAX_RETRIES):
@@ -101,19 +179,19 @@ def process_file(
                             if provider == "ollama" and "connection" in str(e).lower():
                                 console.print("[red]Ollama is not running. Start it with: ollama serve[/red]")
                             if attempt < MAX_RETRIES - 1:
-                                progress.update(task, description=f"Chunk {chunk_count}/{total_chunks} (retry {attempt + 2})")
+                                progress.update(task, description=f"Chunk {chunk_count + 1}/{total_chunks} (retry {attempt + 2})")
                     if raw is None:
-                        err_msg = str(last_error)
-                        report("error", error=err_msg)
+                        report("error", error=str(last_error))
                         raise RuntimeError(f"Generation failed: {last_error}") from last_error
                     cards = parse_cards(raw)
                     source_label = f"Source: {unit_name.capitalize()}s {first_idx}–{last_idx}"
                     for c in cards:
-                        c["chunk_index"] = chunk_count - 1
+                        c["chunk_index"] = chunk_count
                         c["source"] = source_label
                         c["chapter"] = chapter_name
                     all_cards.extend(cards)
-            progress.update(task, completed=total_chunks)
+                    progress.update(task, advance=1)
+                progress.update(task, completed=total_chunks)
 
         if not all_cards:
             console.print("[yellow]No valid cards produced. Writing empty deck.[/yellow]")
@@ -143,43 +221,77 @@ def process_file(
 
     all_cards = []
     num_chunks = len(chunks_list)
+    use_parallel = workers >= 2
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        console=console,
-    ) as progress:
-        task = progress.add_task("Generating cards...", total=num_chunks)
-        for i, (chunk_text, first_idx, last_idx) in enumerate(chunks_list):
-            if cancel_check and cancel_check():
-                report("error", error="Cancelled")
-                raise RuntimeError("Job cancelled") from None
-            report("generating", f"Chunk {i + 1}/{num_chunks}", current=i + 1, total=num_chunks)
-            progress.update(task, description=f"Chunk {i + 1}/{num_chunks}")
-            raw = None
-            last_error = None
-            for attempt in range(MAX_RETRIES):
-                try:
-                    raw = generate(chunk_text, provider=provider, model=model)
-                    break
-                except Exception as e:
-                    last_error = e
-                    if provider == "ollama" and "connection" in str(e).lower():
-                        console.print("[red]Ollama is not running. Start it with: ollama serve[/red]")
-                    if attempt < MAX_RETRIES - 1:
-                        progress.update(task, description=f"Chunk {i + 1}/{num_chunks} (retry {attempt + 2})")
-            if raw is None:
-                err_msg = str(last_error)
-                report("error", error=err_msg)
-                console.print(f"[red]Chunk {i + 1} failed after {MAX_RETRIES} attempts: {last_error}[/red]")
-                raise RuntimeError(f"Generation failed: {last_error}") from last_error
-            cards = parse_cards(raw)
-            source_label = f"Source: {unit_name.capitalize()}s {first_idx}–{last_idx}"
-            for c in cards:
-                c["chunk_index"] = i
-                c["source"] = source_label
-            all_cards.extend(cards)
-        progress.update(task, completed=num_chunks)
+    if use_parallel:
+        chunk_args = [
+            (i, chunk_text, first_idx, last_idx, unit_name, provider, model)
+            for i, (chunk_text, first_idx, last_idx) in enumerate(chunks_list)
+        ]
+        completed = 0
+        results_by_index: dict[int, tuple[list[dict], str]] = {}
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(_process_one_chunk, a): a[0] for a in chunk_args}
+            try:
+                for future in as_completed(futures):
+                    if cancel_check and cancel_check():
+                        report("error", error="Cancelled")
+                        for f in futures:
+                            f.cancel()
+                        raise RuntimeError("Job cancelled") from None
+                    idx = futures[future]
+                    i, cards, source_label = future.result()
+                    results_by_index[i] = (cards, source_label)
+                    completed += 1
+                    report("generating", f"Chunk {completed}/{num_chunks}", current=completed, total=num_chunks)
+            except Exception:
+                for f in futures:
+                    f.cancel()
+                raise
+        for i in range(num_chunks):
+            if i in results_by_index:
+                cards, source_label = results_by_index[i]
+                for c in cards:
+                    c["chunk_index"] = i
+                    c["source"] = source_label
+                all_cards.extend(cards)
+    else:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=console,
+        ) as progress:
+            task = progress.add_task("Generating cards...", total=num_chunks)
+            for i, (chunk_text, first_idx, last_idx) in enumerate(chunks_list):
+                if cancel_check and cancel_check():
+                    report("error", error="Cancelled")
+                    raise RuntimeError("Job cancelled") from None
+                report("generating", f"Chunk {i + 1}/{num_chunks}", current=i + 1, total=num_chunks)
+                progress.update(task, description=f"Chunk {i + 1}/{num_chunks}")
+                raw = None
+                last_error = None
+                for attempt in range(MAX_RETRIES):
+                    try:
+                        raw = generate(chunk_text, provider=provider, model=model)
+                        break
+                    except Exception as e:
+                        last_error = e
+                        if provider == "ollama" and "connection" in str(e).lower():
+                            console.print("[red]Ollama is not running. Start it with: ollama serve[/red]")
+                        if attempt < MAX_RETRIES - 1:
+                            progress.update(task, description=f"Chunk {i + 1}/{num_chunks} (retry {attempt + 2})")
+                if raw is None:
+                    err_msg = str(last_error)
+                    report("error", error=err_msg)
+                    console.print(f"[red]Chunk {i + 1} failed after {MAX_RETRIES} attempts: {last_error}[/red]")
+                    raise RuntimeError(f"Generation failed: {last_error}") from last_error
+                cards = parse_cards(raw)
+                source_label = f"Source: {unit_name.capitalize()}s {first_idx}–{last_idx}"
+                for c in cards:
+                    c["chunk_index"] = i
+                    c["source"] = source_label
+                all_cards.extend(cards)
+            progress.update(task, completed=num_chunks)
 
     if not all_cards:
         console.print("[yellow]No valid cards produced. Writing empty deck.[/yellow]")
@@ -243,6 +355,14 @@ def main() -> int:
         metavar="N",
         help=f"Overlap between consecutive chunks (default: {CHUNK_OVERLAP})",
     )
+    parser.add_argument(
+        "--workers",
+        "-w",
+        type=int,
+        default=CONCURRENT_CHUNKS,
+        metavar="N",
+        help=f"Run N chunks in parallel (default: {CONCURRENT_CHUNKS}). Use 1 for sequential.",
+    )
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -266,6 +386,7 @@ def main() -> int:
                 input_path, deck_name, out_path, args.provider,
                 output_csv_path=csv_path, use_chapters=args.chapters,
                 chunk_size=args.chunk_size, overlap=args.overlap,
+                workers=args.workers,
             )
             console.print(f"[green]Done. Deck written to: {out}[/green]")
             if csv_out:
@@ -291,6 +412,7 @@ def main() -> int:
                 output_csv_path=csv_path,
                 use_chapters=args.chapters,
                 chunk_size=args.chunk_size, overlap=args.overlap,
+                workers=args.workers,
             )
             console.print(f"[green]{f.name} -> {out}[/green]")
             if csv_out:
