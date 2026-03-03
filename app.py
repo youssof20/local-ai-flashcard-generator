@@ -7,10 +7,11 @@ import threading
 import uuid
 from pathlib import Path
 
+import requests
 from flask import Flask, jsonify, render_template_string, request, send_file
 from werkzeug.utils import secure_filename
 
-from config import GEMINI_API_KEY
+from config import GEMINI_API_KEY, OLLAMA_MODEL, OLLAMA_URL
 from main import process_file, sanitize_deck_name, SLIDE_EXTENSIONS
 
 app = Flask(__name__)
@@ -93,6 +94,12 @@ HTML = """<!DOCTYPE html>
     </select>
     <p class="hint" style="margin: -0.5rem 0 1rem 0; font-size: 0.85rem; color: #64748b;">Default: Ollama. Start the Ollama app first if you use it.</p>
 
+    <label for="ollamaModel" id="ollamaModelLabel" style="display: block;">Ollama model</label>
+    <select id="ollamaModel" name="ollama_model" style="display: block;">
+      <option value="" data-default="1">Loading…</option>
+    </select>
+    <p class="hint" id="ollamaModelHint" style="margin: -0.5rem 0 1rem 0; font-size: 0.85rem; color: #64748b; display: block;">Only used when provider is Ollama.</p>
+
     <label style="display: flex; align-items: center; gap: 0.5rem; margin-bottom: 1rem;">
       <input type="checkbox" id="useChapters" name="use_chapters" value="1">
       <span>Use chapter detection (PPTX only: sections/headings → subdecks)</span>
@@ -127,9 +134,18 @@ HTML = """<!DOCTYPE html>
 
     const etaEl = document.getElementById('eta');
     const cancelBtn = document.getElementById('cancelBtn');
+    const providerEl = document.getElementById('provider');
+    const ollamaModelEl = document.getElementById('ollamaModel');
+    const ollamaModelLabel = document.getElementById('ollamaModelLabel');
+    const ollamaModelHint = document.getElementById('ollamaModelHint');
     const phaseLabels = { extracting: 'Reading slides', chunking: 'Preparing content', generating: 'Generating cards', exporting: 'Building deck', exporting_subdecks: 'Building subdecks', done: 'Done', error: 'Error', starting: 'Starting...' };
     let etaStartTime = null;
 
+    function setOllamaModelVisible(visible) {
+      ollamaModelLabel.style.display = visible ? 'block' : 'none';
+      ollamaModelEl.style.display = visible ? 'block' : 'none';
+      ollamaModelHint.style.display = visible ? 'block' : 'none';
+    }
     function setCancelVisible(visible) {
       cancelBtn.style.display = visible ? 'block' : 'none';
     }
@@ -176,11 +192,13 @@ HTML = """<!DOCTYPE html>
       const deck = document.getElementById('deck').value.trim() || fileInput.files[0].name.replace(/\\.(pptx|pdf)$/i, '');
       const provider = document.getElementById('provider').value;
       const useChapters = document.getElementById('useChapters').checked;
+      const ollamaModel = document.getElementById('ollamaModel').value || '';
       const formData = new FormData();
       formData.append('file', fileInput.files[0]);
       formData.append('deck', deck);
       formData.append('provider', provider);
       formData.append('use_chapters', useChapters ? '1' : '0');
+      formData.append('ollama_model', ollamaModel);
 
       submitBtn.disabled = true;
       progressEl.classList.remove('visible');
@@ -221,6 +239,34 @@ HTML = """<!DOCTYPE html>
       }, 600);
     });
 
+    (async function loadOllamaModels() {
+      try {
+        const r = await fetch('/api/ollama-models');
+        const data = await r.json();
+        const models = data.models || [];
+        const defaultModel = data.default || 'llama3.2:latest';
+        ollamaModelEl.innerHTML = '';
+        if (models.length === 0) {
+          const opt = document.createElement('option');
+          opt.value = defaultModel;
+          opt.textContent = defaultModel + ' (default)';
+          ollamaModelEl.appendChild(opt);
+        } else {
+          for (const m of models) {
+            const opt = document.createElement('option');
+            opt.value = m;
+            opt.textContent = m;
+            if (m === defaultModel) opt.selected = true;
+            ollamaModelEl.appendChild(opt);
+          }
+        }
+      } catch (e) {
+        ollamaModelEl.innerHTML = '<option value="llama3.2:latest">llama3.2:latest (default)</option>';
+      }
+      setOllamaModelVisible(providerEl.value === 'ollama');
+    })();
+    providerEl.addEventListener('change', () => setOllamaModelVisible(providerEl.value === 'ollama'));
+
     cancelBtn.addEventListener('click', async () => {
       if (!currentJobId) return;
       try {
@@ -235,7 +281,7 @@ HTML = """<!DOCTYPE html>
 """
 
 
-def run_job(job_id: str, input_path: Path, deck_name: str, provider: str, out_path: Path, out_csv_path: Path, use_chapters: bool = False):
+def run_job(job_id: str, input_path: Path, deck_name: str, provider: str, out_path: Path, out_csv_path: Path, use_chapters: bool = False, model: str | None = None):
     cancel_check = lambda: _is_cancelled(job_id)
     def callback(phase=None, message=None, current=None, total=None, error=None, **kwargs):
         with _jobs_lock:
@@ -256,6 +302,7 @@ def run_job(job_id: str, input_path: Path, deck_name: str, provider: str, out_pa
             output_csv_path=out_csv_path,
             use_chapters=use_chapters,
             cancel_check=cancel_check,
+            model=model if provider == "ollama" else None,
         )
         with _jobs_lock:
             if job_id in jobs:
@@ -291,6 +338,24 @@ def cancel_job(job_id):
     return jsonify({"ok": True, "message": "Cancel requested"})
 
 
+@app.route("/api/ollama-models")
+def ollama_models():
+    """Return list of installed Ollama models and default. Used to populate the model dropdown."""
+    try:
+        url = (OLLAMA_URL or "").rstrip("/") + "/api/tags"
+        r = requests.get(url, timeout=3)
+        r.raise_for_status()
+        data = r.json()
+        models = []
+        for m in (data.get("models") or []):
+            name = m.get("name") if isinstance(m, dict) else getattr(m, "name", None)
+            if name:
+                models.append(name)
+        return jsonify({"models": sorted(models), "default": OLLAMA_MODEL or "llama3.2:latest"})
+    except Exception:
+        return jsonify({"models": [], "default": OLLAMA_MODEL or "llama3.2:latest"})
+
+
 @app.route("/")
 def index():
     return render_template_string(HTML)
@@ -310,6 +375,7 @@ def generate():
     deck_name = (request.form.get("deck") or "").strip() or Path(f.filename).stem
     provider = request.form.get("provider") or "ollama"
     use_chapters = (request.form.get("use_chapters") or "").strip() == "1"
+    ollama_model = (request.form.get("ollama_model") or "").strip() or None
     if provider == "gemini" and not GEMINI_API_KEY:
         return jsonify({"error": "GEMINI_API_KEY not set. Use Ollama or set the key."}), 400
 
@@ -335,7 +401,7 @@ def generate():
             "tmp": tmp,
             "cancelled": False,
         }
-    t = threading.Thread(target=run_job, args=(job_id, input_path, deck_name, provider, out_path, out_csv_path, use_chapters))
+    t = threading.Thread(target=run_job, args=(job_id, input_path, deck_name, provider, out_path, out_csv_path, use_chapters, ollama_model))
     t.daemon = True
     t.start()
     return jsonify({"job_id": job_id})

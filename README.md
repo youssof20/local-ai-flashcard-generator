@@ -52,7 +52,7 @@ Run the local web interface, then open a browser:
 python app.py
 ```
 
-Open **http://127.0.0.1:5000** in your browser. Upload a PPTX or PDF, enter a deck name (or leave blank to use the filename), choose Ollama or Gemini, optionally check **Use chapter detection** (PPTX only: splits by sections/headings into subdecks), and click **Generate deck**. Progress (reading slides → generating cards → building deck) is shown; when done, download the `.apkg` and import it into Anki.
+Open **http://127.0.0.1:5000** in your browser. **Start Ollama first** (open the Ollama app or run `ollama serve`) so generation works. Upload a PPTX or PDF, enter a deck name (or leave blank to use the filename), choose Ollama or Gemini, pick an Ollama model if you have several installed, optionally check **Use chapter detection** (PPTX only), and click **Generate deck**. Progress and ETA are shown; when done, download the `.apkg` (Anki) or `.csv` (Knowt).
 
 ### Command line
 

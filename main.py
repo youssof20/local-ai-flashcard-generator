@@ -45,6 +45,7 @@ def process_file(
     chunk_size: int = CHUNK_SIZE,
     overlap: int = CHUNK_OVERLAP,
     cancel_check: Callable[[], bool] | None = None,
+    model: str | None = None,
 ) -> tuple[Path, Path | None]:
     """
     Extract, chunk, generate, parse, export for one file.
@@ -93,11 +94,11 @@ def process_file(
                     last_error = None
                     for attempt in range(MAX_RETRIES):
                         try:
-                            raw = generate(chunk_text, provider=provider)
-                            break
-                        except Exception as e:
-                            last_error = e
-                            if provider == "ollama" and "connection" in str(e).lower():
+            raw = generate(chunk_text, provider=provider, model=model)
+            break
+        except Exception as e:
+            last_error = e
+            if provider == "ollama" and "connection" in str(e).lower():
                                 console.print("[red]Ollama is not running. Start it with: ollama serve[/red]")
                             if attempt < MAX_RETRIES - 1:
                                 progress.update(task, description=f"Chunk {chunk_count}/{total_chunks} (retry {attempt + 2})")
@@ -159,7 +160,7 @@ def process_file(
             last_error = None
             for attempt in range(MAX_RETRIES):
                 try:
-                    raw = generate(chunk_text, provider=provider)
+                    raw = generate(chunk_text, provider=provider, model=model)
                     break
                 except Exception as e:
                     last_error = e
