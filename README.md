@@ -84,7 +84,16 @@ python main.py --input "Lecture1.pptx" --deck "Biochem Week 1" --provider gemini
 
 1. Open [Anki](https://apps.ankiweb.net/) (free, cross-platform).
 2. **File → Import** and select the `.apkg` file.
-3. The deck appears with Basic and Cloze cards; study as usual.
+3. The deck appears with Basic and Cloze cards; each card back shows **Source: Slides X–Y** (or Pages) for reference.
+
+## Import into Knowt
+
+[Knowt](https://knowt.com) offers free learn mode, spaced repetition, and practice tests. Use the **CSV** download (or the `.csv` file from the CLI):
+
+1. In the web UI, click **Download for Knowt (.csv)**. From the CLI, a `DeckName.csv` is written next to the `.apkg`.
+2. In Knowt, create a new set → **Import manually** (or **Import from Quizlet** if you prefer).
+3. Paste the CSV contents or upload the file. Set separators: comma between term/definition, newline between rows.
+4. Cloze cards appear as term + “(cloze — best viewed in Anki)”; for full cloze support use the Anki deck.
 
 ## What gets excluded
 

@@ -10,15 +10,16 @@ def chunk(
     chunk_size: int = CHUNK_SIZE,
     overlap: int = CHUNK_OVERLAP,
     unit_name: str = "slides",
-) -> list[str]:
+) -> list[tuple[str, int, int]]:
     """
     Group items into chunks of chunk_size with overlap between consecutive chunks.
-    Prepend a CONTEXT line to each chunk. Returns list of chunk strings.
+    Prepend a CONTEXT line to each chunk.
+    Returns list of (chunk_text, first_index, last_index) for source tagging.
     """
     if not items:
         return []
 
-    chunks: list[str] = []
+    result: list[tuple[str, int, int]] = []
     step = max(1, chunk_size - overlap)
     i = 0
     while i < len(items):
@@ -33,7 +34,7 @@ def chunk(
         )
         label = unit_name.rstrip("s").capitalize()  # "slides" -> "Slide", "pages" -> "Page"
         body = "\n\n".join(f"{label} {idx}:\n{text}" for idx, text in window)
-        chunks.append(context + body)
+        result.append((context + body, first_idx, last_idx))
         i += step
 
-    return chunks
+    return result

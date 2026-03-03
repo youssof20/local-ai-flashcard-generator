@@ -12,7 +12,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from chunker import chunk
 from config import GEMINI_API_KEY, MAX_RETRIES
-from exporter import build_deck, write_apkg
+from exporter import build_deck, write_apkg, write_csv
 from extractor import extract
 from generator import generate
 from parser import parse_cards
@@ -40,12 +40,13 @@ def process_file(
     output_path: Path | None,
     provider: str,
     progress_callback: Callable[..., None] | None = None,
-) -> Path:
+    output_csv_path: Path | None = None,
+) -> tuple[Path, Path | None]:
     """
     Extract, chunk, generate, parse, export for one file.
     progress_callback(phase, message=None, current=None, total=None) is called for UI updates.
     phase: "extracting" | "chunking" | "generating" | "exporting" | "done" | "error"
-    Returns the path to the written .apkg file.
+    Returns (apkg_path, csv_path or None).
     """
     def report(phase: str, message: str | None = None, current: int | None = None, total: int | None = None, error: str | None = None):
         if progress_callback:
@@ -72,7 +73,7 @@ def process_file(
         console=console,
     ) as progress:
         task = progress.add_task("Generating cards...", total=num_chunks)
-        for i, chunk_text in enumerate(chunks_list):
+        for i, (chunk_text, first_idx, last_idx) in enumerate(chunks_list):
             report("generating", f"Chunk {i + 1}/{num_chunks}", current=i + 1, total=num_chunks)
             progress.update(task, description=f"Chunk {i + 1}/{num_chunks}")
             raw = None
@@ -93,8 +94,10 @@ def process_file(
                 console.print(f"[red]Chunk {i + 1} failed after {MAX_RETRIES} attempts: {last_error}[/red]")
                 raise RuntimeError(f"Generation failed: {last_error}") from last_error
             cards = parse_cards(raw)
+            source_label = f"Source: {unit_name.capitalize()}s {first_idx}–{last_idx}"
             for c in cards:
                 c["chunk_index"] = i
+                c["source"] = source_label
             all_cards.extend(cards)
         progress.update(task, completed=num_chunks)
 
@@ -105,8 +108,12 @@ def process_file(
     deck = build_deck(all_cards, deck_name)
     out = output_path or Path(sanitize_deck_name(deck_name) + ".apkg")
     write_apkg(deck, str(out))
+    csv_out: Path | None = None
+    if output_csv_path is not None:
+        write_csv(all_cards, str(output_csv_path))
+        csv_out = output_csv_path
     report("done", message=str(out))
-    return out
+    return (out, csv_out)
 
 
 def main() -> int:
@@ -155,8 +162,11 @@ def main() -> int:
                 return 1
             deck_name = args.deck or input_path.stem
             out_path = Path(args.output) if args.output else None
-            out = process_file(input_path, deck_name, out_path, args.provider)
+            csv_path = out_path.with_suffix(".csv") if out_path else Path(sanitize_deck_name(deck_name) + ".csv")
+            out, csv_out = process_file(input_path, deck_name, out_path, args.provider, output_csv_path=csv_path)
             console.print(f"[green]Done. Deck written to: {out}[/green]")
+            if csv_out:
+                console.print(f"[green]Knowt/Quizlet CSV: {csv_out}[/green]")
             return 0
 
         # Directory
@@ -172,7 +182,7 @@ def main() -> int:
         prefix = (args.deck + " - ") if args.deck else ""
         for f in files:
             deck_name = prefix + f.stem
-            out = process_file(f, deck_name, None, args.provider)
+            out, csv_out = process_file(f, deck_name, None, args.provider)
             console.print(f"[green]{f.name} -> {out}[/green]")
         return 0
     except (ValueError, RuntimeError, OSError) as e:

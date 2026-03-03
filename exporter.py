@@ -4,30 +4,31 @@ import re
 
 import genanki
 
-# Basic (and reversed card) — two templates: Front→Back and Back→Front
+# Basic (and reversed card) — Front, Back, Source (for [Source: Slides X–Y] on card back)
 BASIC_MODEL = genanki.Model(
     1485830180,
     "Basic (and reversed card)",
     fields=[
         {"name": "Front", "font": "Arial"},
         {"name": "Back", "font": "Arial"},
+        {"name": "Source", "font": "Arial"},
     ],
     templates=[
         {
             "name": "Card 1",
             "qfmt": "{{Front}}",
-            "afmt": "{{FrontSide}}\n\n<hr id=answer>\n\n{{Back}}",
+            "afmt": "{{FrontSide}}\n\n<hr id=answer>\n\n{{Back}}\n\n<div style='font-size: 12px; color: #666; margin-top: 1em;'>{{Source}}</div>",
         },
         {
             "name": "Card 2",
             "qfmt": "{{Back}}",
-            "afmt": "{{FrontSide}}\n\n<hr id=answer>\n\n{{Front}}",
+            "afmt": "{{FrontSide}}\n\n<hr id=answer>\n\n{{Front}}\n\n<div style='font-size: 12px; color: #666; margin-top: 1em;'>{{Source}}</div>",
         },
     ],
     css=".card {\n font-family: arial;\n font-size: 20px;\n text-align: center;\n color: black;\n background-color: white;\n}\n",
 )
 
-# Cloze — Anki-compatible cloze model (standard ID used by many exporters)
+# Cloze — Anki-compatible cloze model; Back Extra used for source
 CLOZE_MODEL = genanki.Model(
     1480089192,
     "Cloze",
@@ -40,7 +41,7 @@ CLOZE_MODEL = genanki.Model(
         {
             "name": "Cloze",
             "qfmt": "{{cloze:Text}}",
-            "afmt": "{{cloze:Text}}<br>\n{{Back Extra}}",
+            "afmt": "{{cloze:Text}}<br>\n<div style='font-size: 12px; color: #666;'>{{Back Extra}}</div>",
         },
     ],
     css=".card {\n font-family: arial;\n font-size: 20px;\n text-align: center;\n color: black;\n background-color: white;\n}\n\n"
@@ -85,13 +86,15 @@ def build_deck(
         card_type = (card.get("type") or "basic").lower()
         tags = _tags_list(card, deck_name)
 
+        source = card.get("source") or ""
+
         if card_type == "basic":
             front = card.get("front") or ""
             back = card.get("back") or ""
             guid = genanki.guid_for(front, back)
             note = genanki.Note(
                 model=BASIC_MODEL,
-                fields=[front, back],
+                fields=[front, back, source],
                 tags=tags,
                 guid=guid,
             )
@@ -99,10 +102,9 @@ def build_deck(
         elif card_type == "cloze":
             text = card.get("text") or ""
             guid = genanki.guid_for(text)
-            # Cloze model has Text and Back Extra; we only use Text
             note = genanki.Note(
                 model=CLOZE_MODEL,
-                fields=[text, ""],
+                fields=[text, source],
                 tags=tags,
                 guid=guid,
             )
@@ -114,3 +116,28 @@ def build_deck(
 def write_apkg(deck: genanki.Deck, path: str) -> None:
     """Write deck to a .apkg file."""
     genanki.Package(deck).write_to_file(path)
+
+
+def write_csv(cards: list[dict], path: str) -> None:
+    """
+    Write cards to a CSV file for import into Knowt (or Quizlet).
+    Knowt: Create set → Import manually → paste or upload; use comma between term/definition, newline between rows.
+    First row is header: Term,Definition
+    Basic cards: front = term, back = definition. Cloze: text (with {{c1::...}}) = term, "(cloze)" = definition.
+    """
+    import csv
+    rows = [["Term", "Definition"]]
+    for card in cards:
+        ctype = (card.get("type") or "basic").lower()
+        if ctype == "basic":
+            front = (card.get("front") or "").strip()
+            back = (card.get("back") or "").strip()
+            if front or back:
+                rows.append([front, back])
+        else:
+            text = (card.get("text") or "").strip()
+            if text:
+                rows.append([text, "(cloze — best viewed in Anki)"])
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerows(rows)

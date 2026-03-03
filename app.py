@@ -14,7 +14,7 @@ from main import process_file, sanitize_deck_name, SLIDE_EXTENSIONS
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024  # 100 MB
 
-# In-memory job state: job_id -> { phase, message, current, total, path, error, filename }
+# In-memory job state: job_id -> { phase, message, current, total, path, csv_path, error, filename, csv_filename }
 jobs: dict = {}
 _jobs_lock = threading.Lock()
 
@@ -39,6 +39,7 @@ HTML = """<!DOCTYPE html>
     .progress.visible { display: block; }
     .progress .phase { font-weight: 500; color: #334155; }
     .progress .detail { color: #64748b; margin-top: 0.25rem; }
+    .progress .eta { font-size: 0.85rem; color: #64748b; margin-top: 0.2rem; }
     .progress .bar { margin-top: 0.5rem; height: 6px; background: #e2e8f0; border-radius: 3px; overflow: hidden; }
     .progress .bar-fill { height: 100%; background: #2563eb; border-radius: 3px; transition: width 0.2s; }
     .progress.error .phase { color: #b91c1c; }
@@ -53,21 +54,22 @@ HTML = """<!DOCTYPE html>
 </head>
 <body>
   <h1>Flashcard Generator</h1>
-  <p class="sub">Upload a lecture slide deck (PPTX or PDF) and get an Anki-ready deck.</p>
+  <p class="sub">Upload slides (PPTX or PDF) and get a flashcard deck. Use with Anki or <a href="https://knowt.com" target="_blank" rel="noopener">Knowt</a> (free learn mode).</p>
 
   <form id="form">
-    <label for="file">Slide deck (PPTX or PDF)</label>
+    <label for="file">Slide deck</label>
     <input type="file" id="file" name="file" accept=".pptx,.pdf" required>
+    <p class="hint" style="margin: -0.5rem 0 1rem 0; font-size: 0.85rem; color: #64748b;">PPTX or PDF only.</p>
 
-    <label for="deck">Deck name</label>
-    <input type="text" id="deck" name="deck" placeholder="e.g. Biochemistry Week 1">
+    <label for="deck">Deck name <span style="font-weight: normal; color: #64748b;">(optional)</span></label>
+    <input type="text" id="deck" name="deck" placeholder="Leave blank to use file name">
 
-    <label for="provider">Provider</label>
+    <label for="provider">AI provider</label>
     <select id="provider" name="provider">
-      <option value="ollama">Ollama (local, free)</option>
-      <option value="gemini">Gemini (needs API key)</option>
+      <option value="ollama" selected>Ollama — free, runs on your PC</option>
+      <option value="gemini">Gemini — needs API key</option>
     </select>
-    <p class="hint" id="providerHint" style="margin: -0.5rem 0 1rem 0; font-size: 0.85rem; color: #64748b;">If using Ollama, start it first (run <code>ollama serve</code> or open the Ollama app).</p>
+    <p class="hint" style="margin: -0.5rem 0 1rem 0; font-size: 0.85rem; color: #64748b;">Default: Ollama. Start the Ollama app first if you use it.</p>
 
     <button type="submit" id="submit">Generate deck</button>
   </form>
@@ -75,11 +77,14 @@ HTML = """<!DOCTYPE html>
   <div id="progress" class="progress">
     <div class="phase" id="phase">—</div>
     <div class="detail" id="detail"></div>
+    <div class="eta" id="eta"></div>
     <div class="bar"><div class="bar-fill" id="barFill" style="width: 0%"></div></div>
   </div>
 
   <div id="download" class="download">
-    <a id="downloadLink" href="#">Download .apkg</a>
+    <p style="margin-bottom: 0.5rem; font-weight: 500;">Your deck is ready.</p>
+    <a id="downloadAnki" href="#">Download for Anki (.apkg)</a>
+    <a id="downloadKnowt" href="#" style="margin-left: 0.5rem;">Download for Knowt (.csv)</a>
   </div>
 
   <script>
@@ -90,15 +95,30 @@ HTML = """<!DOCTYPE html>
     const detailEl = document.getElementById('detail');
     const barFill = document.getElementById('barFill');
     const downloadEl = document.getElementById('download');
-    const downloadLink = document.getElementById('downloadLink');
 
+    const etaEl = document.getElementById('eta');
     const phaseLabels = { extracting: 'Reading slides', chunking: 'Preparing content', generating: 'Generating cards', exporting: 'Building deck', done: 'Done', error: 'Error', starting: 'Starting...' };
+    let etaStartTime = null;
+
     function showProgress(phase, message, current, total, isError) {
       progressEl.classList.add('visible');
       if (isError) progressEl.classList.add('error');
       else progressEl.classList.remove('error');
       phaseEl.textContent = phaseLabels[phase] || phase || 'Processing...';
       detailEl.textContent = message || '';
+      if (total && total > 0 && current != null && phase === 'generating') {
+        if (!etaStartTime) etaStartTime = Date.now();
+        const elapsed = (Date.now() - etaStartTime) / 1000;
+        const remaining = current > 0 ? (elapsed / current) * (total - current) : 0;
+        if (remaining > 60) etaEl.textContent = 'About ' + Math.ceil(remaining / 60) + ' min left';
+        else if (remaining > 5) etaEl.textContent = 'About ' + Math.ceil(remaining) + ' sec left';
+        else etaEl.textContent = '';
+      } else if (phase === 'done' || phase === 'error') {
+        etaEl.textContent = '';
+        etaStartTime = null;
+      } else {
+        etaEl.textContent = '';
+      }
       let pct = 0;
       if (total && total > 0 && current != null) pct = Math.round((current / total) * 100);
       else if (phase === 'done') pct = 100;
@@ -106,11 +126,14 @@ HTML = """<!DOCTYPE html>
     }
 
     let currentJobId = null;
-    function showDownload(filename) {
+    function showDownload(filename, csvFilename) {
       downloadEl.classList.add('visible');
-      if (currentJobId) downloadLink.href = '/download/' + currentJobId;
-      downloadLink.download = filename || 'deck.apkg';
-      downloadLink.textContent = 'Download ' + (filename || 'deck.apkg');
+      if (currentJobId) {
+        document.getElementById('downloadAnki').href = '/download/' + currentJobId;
+        document.getElementById('downloadKnowt').href = '/download/' + currentJobId + '?format=csv';
+      }
+      document.getElementById('downloadAnki').download = filename || 'deck.apkg';
+      document.getElementById('downloadKnowt').download = csvFilename || 'deck.csv';
     }
 
     form.addEventListener('submit', async (e) => {
@@ -151,7 +174,7 @@ HTML = """<!DOCTYPE html>
         if (sdata.phase === 'done') {
           clearInterval(poll);
           submitBtn.disabled = false;
-          showDownload(sdata.filename || 'deck.apkg');
+          showDownload(sdata.filename || 'deck.apkg', sdata.csv_filename || 'deck.csv');
         } else if (sdata.phase === 'error') {
           clearInterval(poll);
           submitBtn.disabled = false;
@@ -164,7 +187,7 @@ HTML = """<!DOCTYPE html>
 """
 
 
-def run_job(job_id: str, input_path: Path, deck_name: str, provider: str, out_path: Path):
+def run_job(job_id: str, input_path: Path, deck_name: str, provider: str, out_path: Path, out_csv_path: Path):
     def callback(phase=None, message=None, current=None, total=None, error=None, **kwargs):
         with _jobs_lock:
             if job_id not in jobs:
@@ -178,12 +201,18 @@ def run_job(job_id: str, input_path: Path, deck_name: str, provider: str, out_pa
                 jobs[job_id]["message"] = error
 
     try:
-        process_file(input_path, deck_name, out_path, provider, progress_callback=callback)
+        _, csv_path = process_file(
+            input_path, deck_name, out_path, provider,
+            progress_callback=callback,
+            output_csv_path=out_csv_path,
+        )
         with _jobs_lock:
             if job_id in jobs:
                 jobs[job_id]["phase"] = "done"
                 jobs[job_id]["path"] = str(out_path)
                 jobs[job_id]["filename"] = out_path.name
+                jobs[job_id]["csv_path"] = str(csv_path) if csv_path else None
+                jobs[job_id]["csv_filename"] = csv_path.name if csv_path else None
     except Exception as e:
         with _jobs_lock:
             if job_id in jobs:
@@ -217,6 +246,7 @@ def generate():
     f.save(str(input_path))
     out_name = sanitize_deck_name(deck_name) + ".apkg"
     out_path = Path(tmp) / out_name
+    out_csv_path = Path(tmp) / (sanitize_deck_name(deck_name) + ".csv")
 
     with _jobs_lock:
         jobs[job_id] = {
@@ -225,11 +255,13 @@ def generate():
             "current": None,
             "total": None,
             "path": None,
+            "csv_path": None,
             "filename": out_name,
+            "csv_filename": None,
             "error": None,
             "tmp": tmp,
         }
-    t = threading.Thread(target=run_job, args=(job_id, input_path, deck_name, provider, out_path))
+    t = threading.Thread(target=run_job, args=(job_id, input_path, deck_name, provider, out_path, out_csv_path))
     t.daemon = True
     t.start()
     return jsonify({"job_id": job_id})
@@ -247,24 +279,28 @@ def status(job_id):
         "current": job.get("current"),
         "total": job.get("total"),
         "filename": job.get("filename"),
+        "csv_filename": job.get("csv_filename"),
     })
 
 
 @app.route("/download/<job_id>")
 def download(job_id):
+    fmt = request.args.get("format", "apkg")
     with _jobs_lock:
         job = jobs.get(job_id)
-    if not job or job.get("phase") != "done" or not job.get("path"):
+    if not job or job.get("phase") != "done":
         return "Not found", 404
-    path = Path(job["path"])
-    if not path.exists():
+    if fmt == "csv":
+        path = Path(job.get("csv_path") or "")
+        name = job.get("csv_filename") or "deck.csv"
+        mimetype = "text/csv"
+    else:
+        path = Path(job.get("path") or "")
+        name = job.get("filename") or "deck.apkg"
+        mimetype = "application/octet-stream"
+    if not path or not path.exists():
         return "File expired", 404
-    return send_file(
-        path,
-        as_attachment=True,
-        download_name=job.get("filename") or "deck.apkg",
-        mimetype="application/octet-stream",
-    )
+    return send_file(path, as_attachment=True, download_name=name, mimetype=mimetype)
 
 
 if __name__ == "__main__":
