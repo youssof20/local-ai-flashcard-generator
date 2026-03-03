@@ -1,12 +1,14 @@
 """Lightweight web UI for the flashcard generator."""
 
 import os
+import shutil
 import tempfile
 import threading
 import uuid
 from pathlib import Path
 
 from flask import Flask, jsonify, render_template_string, request, send_file
+from werkzeug.utils import secure_filename
 
 from config import GEMINI_API_KEY
 from main import process_file, sanitize_deck_name, SLIDE_EXTENSIONS
@@ -14,9 +16,27 @@ from main import process_file, sanitize_deck_name, SLIDE_EXTENSIONS
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024  # 100 MB
 
-# In-memory job state: job_id -> { phase, message, current, total, path, csv_path, error, filename, csv_filename }
+# In-memory job state: job_id -> { phase, message, current, total, path, csv_path, error, filename, csv_filename, tmp, cancelled }
+# Temp files are kept for JOB_RETENTION_MINUTES so users can download; then job and tmp dir are removed.
+JOB_RETENTION_MINUTES = 10
 jobs: dict = {}
 _jobs_lock = threading.Lock()
+
+
+def _is_cancelled(job_id: str) -> bool:
+    with _jobs_lock:
+        return bool(jobs.get(job_id, {}).get("cancelled"))
+
+
+def _cleanup_job(job_id: str) -> None:
+    """Remove job from memory and delete its temp directory."""
+    with _jobs_lock:
+        job = jobs.pop(job_id, None)
+    if job and job.get("tmp"):
+        try:
+            shutil.rmtree(job["tmp"], ignore_errors=True)
+        except OSError:
+            pass
 
 HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -35,6 +55,8 @@ HTML = """<!DOCTYPE html>
     button { width: 100%; padding: 0.65rem 1rem; font-size: 1rem; font-weight: 500; border: none; border-radius: 6px; background: #2563eb; color: white; cursor: pointer; }
     button:hover { background: #1d4ed8; }
     button:disabled { background: #94a3b8; cursor: not-allowed; }
+    .cancel-btn { width: auto; padding: 0.4rem 0.8rem; font-size: 0.9rem; background: #64748b; }
+    .cancel-btn:hover { background: #475569; }
     .progress { margin-top: 1.25rem; padding: 1rem; background: #f1f5f9; border-radius: 8px; font-size: 0.9rem; display: none; }
     .progress.visible { display: block; }
     .progress .phase { font-weight: 500; color: #334155; }
@@ -84,12 +106,14 @@ HTML = """<!DOCTYPE html>
     <div class="detail" id="detail"></div>
     <div class="eta" id="eta"></div>
     <div class="bar"><div class="bar-fill" id="barFill" style="width: 0%"></div></div>
+    <button type="button" id="cancelBtn" class="cancel-btn" style="display: none; margin-top: 0.5rem;">Cancel</button>
   </div>
 
   <div id="download" class="download">
     <p style="margin-bottom: 0.5rem; font-weight: 500;">Your deck is ready.</p>
     <a id="downloadAnki" href="#">Download for Anki (.apkg)</a>
     <a id="downloadKnowt" href="#" style="margin-left: 0.5rem;">Download for Knowt (.csv)</a>
+    <p class="hint" style="margin-top: 0.5rem; font-size: 0.85rem; color: #64748b;">Downloads are kept for 10 minutes; save the files locally.</p>
   </div>
 
   <script>
@@ -102,8 +126,13 @@ HTML = """<!DOCTYPE html>
     const downloadEl = document.getElementById('download');
 
     const etaEl = document.getElementById('eta');
-    const phaseLabels = { extracting: 'Reading slides', chunking: 'Preparing content', generating: 'Generating cards', exporting: 'Building deck', done: 'Done', error: 'Error', starting: 'Starting...' };
+    const cancelBtn = document.getElementById('cancelBtn');
+    const phaseLabels = { extracting: 'Reading slides', chunking: 'Preparing content', generating: 'Generating cards', exporting: 'Building deck', exporting_subdecks: 'Building subdecks', done: 'Done', error: 'Error', starting: 'Starting...' };
     let etaStartTime = null;
+
+    function setCancelVisible(visible) {
+      cancelBtn.style.display = visible ? 'block' : 'none';
+    }
 
     function showProgress(phase, message, current, total, isError) {
       progressEl.classList.add('visible');
@@ -156,6 +185,7 @@ HTML = """<!DOCTYPE html>
       submitBtn.disabled = true;
       progressEl.classList.remove('visible');
       downloadEl.classList.remove('visible');
+      setCancelVisible(true);
       showProgress('Uploading...', '', 0, 0);
 
       const r = await fetch('/generate', { method: 'POST', body: formData });
@@ -181,12 +211,23 @@ HTML = """<!DOCTYPE html>
         if (sdata.phase === 'done') {
           clearInterval(poll);
           submitBtn.disabled = false;
+          setCancelVisible(false);
           showDownload(sdata.filename || 'deck.apkg', sdata.csv_filename || 'deck.csv');
         } else if (sdata.phase === 'error') {
           clearInterval(poll);
           submitBtn.disabled = false;
+          setCancelVisible(false);
         }
       }, 600);
+    });
+
+    cancelBtn.addEventListener('click', async () => {
+      if (!currentJobId) return;
+      try {
+        await fetch('/cancel/' + currentJobId, { method: 'POST' });
+        cancelBtn.disabled = true;
+        cancelBtn.textContent = 'Cancelling…';
+      } catch (e) {}
     });
   </script>
 </body>
@@ -195,6 +236,7 @@ HTML = """<!DOCTYPE html>
 
 
 def run_job(job_id: str, input_path: Path, deck_name: str, provider: str, out_path: Path, out_csv_path: Path, use_chapters: bool = False):
+    cancel_check = lambda: _is_cancelled(job_id)
     def callback(phase=None, message=None, current=None, total=None, error=None, **kwargs):
         with _jobs_lock:
             if job_id not in jobs:
@@ -213,6 +255,7 @@ def run_job(job_id: str, input_path: Path, deck_name: str, provider: str, out_pa
             progress_callback=callback,
             output_csv_path=out_csv_path,
             use_chapters=use_chapters,
+            cancel_check=cancel_check,
         )
         with _jobs_lock:
             if job_id in jobs:
@@ -221,11 +264,31 @@ def run_job(job_id: str, input_path: Path, deck_name: str, provider: str, out_pa
                 jobs[job_id]["filename"] = out_path.name
                 jobs[job_id]["csv_path"] = str(csv_path) if csv_path else None
                 jobs[job_id]["csv_filename"] = csv_path.name if csv_path else None
+        # Schedule cleanup so user has time to download; then temp dir is removed
+        timer = threading.Timer(JOB_RETENTION_MINUTES * 60.0, _cleanup_job, [job_id])
+        timer.daemon = True
+        timer.start()
     except Exception as e:
         with _jobs_lock:
             if job_id in jobs:
                 jobs[job_id]["phase"] = "error"
                 jobs[job_id]["message"] = str(e)
+        timer = threading.Timer(JOB_RETENTION_MINUTES * 60.0, _cleanup_job, [job_id])
+        timer.daemon = True
+        timer.start()
+
+
+@app.route("/cancel/<job_id>", methods=["POST"])
+def cancel_job(job_id):
+    with _jobs_lock:
+        job = jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "Unknown job"}), 404
+    if job.get("phase") in ("done", "error"):
+        return jsonify({"ok": True, "message": "Job already finished"}), 200
+    with _jobs_lock:
+        jobs[job_id]["cancelled"] = True
+    return jsonify({"ok": True, "message": "Cancel requested"})
 
 
 @app.route("/")
@@ -243,6 +306,7 @@ def generate():
     ext = Path(f.filename).suffix.lower()
     if ext not in SLIDE_EXTENSIONS:
         return jsonify({"error": "Use a .pptx or .pdf file"}), 400
+    safe_name = secure_filename(Path(f.filename).name) or ("upload" + ext)
     deck_name = (request.form.get("deck") or "").strip() or Path(f.filename).stem
     provider = request.form.get("provider") or "ollama"
     use_chapters = (request.form.get("use_chapters") or "").strip() == "1"
@@ -251,7 +315,7 @@ def generate():
 
     job_id = str(uuid.uuid4())
     tmp = tempfile.mkdtemp()
-    input_path = Path(tmp) / f.filename
+    input_path = Path(tmp) / safe_name
     f.save(str(input_path))
     out_name = sanitize_deck_name(deck_name) + ".apkg"
     out_path = Path(tmp) / out_name
@@ -269,6 +333,7 @@ def generate():
             "csv_filename": None,
             "error": None,
             "tmp": tmp,
+            "cancelled": False,
         }
     t = threading.Thread(target=run_job, args=(job_id, input_path, deck_name, provider, out_path, out_csv_path, use_chapters))
     t.daemon = True

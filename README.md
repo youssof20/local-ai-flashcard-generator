@@ -19,11 +19,13 @@ Decks are built with cognitive-science principles: one fact per card, active rec
 
 ### 2. Pull a model (one-time)
 
+The app uses `llama3.2:latest` by default. Pull it (or another model):
+
 ```bash
-ollama pull qwen2.5:14b
+ollama pull llama3.2:latest
 ```
 
-Use `mistral:7b` or `llama3.2:3b` if you have less RAM.
+For better quality use `ollama pull qwen2.5:14b`. Use `mistral:7b` or `llama3.2:3b` if you have less RAM. To use a different model without changing code, set `OLLAMA_MODEL` (e.g. `set OLLAMA_MODEL=qwen2.5:14b`).
 
 ### 3. Install Python dependencies
 
@@ -50,7 +52,7 @@ Run the local web interface, then open a browser:
 python app.py
 ```
 
-Open **http://127.0.0.1:5000** in your browser. Upload a PPTX or PDF, enter a deck name (or leave blank to use the filename), choose Ollama or Gemini, and click **Generate deck**. Progress (reading slides → generating cards → building deck) is shown; when done, download the `.apkg` and import it into Anki.
+Open **http://127.0.0.1:5000** in your browser. Upload a PPTX or PDF, enter a deck name (or leave blank to use the filename), choose Ollama or Gemini, optionally check **Use chapter detection** (PPTX only: splits by sections/headings into subdecks), and click **Generate deck**. Progress (reading slides → generating cards → building deck) is shown; when done, download the `.apkg` and import it into Anki.
 
 ### Command line
 
@@ -80,6 +82,18 @@ python main.py --input ./week1_slides/ --deck "Biochemistry Module 1"
 python main.py --input "Lecture1.pptx" --deck "Biochem Week 1" --provider gemini
 ```
 
+**Chapter detection (PPTX only):** Create subdecks (e.g. `DeckName::Chapter 1`) from PowerPoint sections or from slides titled "Chapter N", "Week N", etc.:
+
+```bash
+python main.py --input "Lecture1.pptx" --deck "Biochem Week 1" --chapters
+```
+
+**Chunk size (advanced):** Control how many slides/pages are sent to the LLM per request (default 6, overlap 1):
+
+```bash
+python main.py --input "Lecture1.pptx" --deck "Biochem" --chunk-size 8 --overlap 2
+```
+
 ## Import into Anki
 
 1. Open [Anki](https://apps.ankiweb.net/) (free, cross-platform).
@@ -107,10 +121,18 @@ Cards are not created for **course or syllabus metadata**: course name, instruct
 4. **Parse** — JSON is stripped of markdown, validated, and deduplicated.
 5. **Export** — Cards are written to an Anki deck (Basic with reverse + Cloze) with stable GUIDs so re-running updates existing cards instead of duplicating them.
 
+## Testing
+
+From the project root:
+
+```bash
+pip install -r requirements.txt
+python -m pytest tests/ -v
+```
+
 ## Troubleshooting
 
 - **"Ollama is not running"** — Start Ollama (it often runs in the background after install), or run `ollama serve`. On Windows, open the Ollama app from the Start menu (don’t run `ollama serve` if the app is already open).
 - **Ollama not reachable on Windows** — The app uses `127.0.0.1` by default. If it still fails, in PowerShell run `Invoke-WebRequest -Uri http://127.0.0.1:11434/api/tags -Method GET` to confirm Ollama is responding. If that works, try generating again.
 - **"GEMINI_API_KEY is not set"** — Only needed for `--provider gemini`. Use Ollama without a key.
 - **No cards / few cards** — Check that the slides contain real text (not only images). Try `--provider gemini` for trickier material.
-"# local-ai-flashcard-generator" 

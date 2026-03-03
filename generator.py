@@ -180,9 +180,25 @@ def call_gemini(chunk_text: str, model: str | None = None) -> str:
             max_output_tokens=8192,
         ),
     )
-    if not response.text:
+    # Check for blocked or empty response (e.g. safety filter)
+    if response.candidates:
+        c = response.candidates[0]
+        finish = getattr(c, "finish_reason", None) or getattr(c, "finish_reason_enum", None)
+        if finish is not None and str(finish).endswith("SAFETY"):
+            raise RuntimeError(
+                "Gemini blocked this content (safety filter). Try a different chunk or provider."
+            )
+        if not getattr(c, "content", None) or not getattr(c.content, "parts", None):
+            raise RuntimeError("Gemini returned no content for this chunk.")
+    try:
+        text = (response.text or "").strip()
+    except ValueError as e:
+        raise RuntimeError(
+            "Gemini returned a blocked or invalid response. Try again or use Ollama."
+        ) from e
+    if not text:
         raise RuntimeError("Gemini returned empty response")
-    return response.text.strip()
+    return text
 
 
 def generate(chunk_text: str, provider: str = "ollama", model: str | None = None) -> str:

@@ -11,11 +11,11 @@ from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from chunker import chunk
-from config import GEMINI_API_KEY, MAX_RETRIES
+from config import CHUNK_OVERLAP, CHUNK_SIZE, GEMINI_API_KEY, MAX_RETRIES
 from exporter import build_deck, build_decks_by_chapter, write_apkg, write_apkg_multi, write_csv
 from extractor import extract, extract_pptx_with_chapters
 from generator import generate
-from parser import parse_cards
+from parser import ParseError, parse_cards
 
 console = Console()
 
@@ -42,6 +42,9 @@ def process_file(
     progress_callback: Callable[..., None] | None = None,
     output_csv_path: Path | None = None,
     use_chapters: bool = False,
+    chunk_size: int = CHUNK_SIZE,
+    overlap: int = CHUNK_OVERLAP,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> tuple[Path, Path | None]:
     """
     Extract, chunk, generate, parse, export for one file.
@@ -65,7 +68,7 @@ def process_file(
             raise ValueError("No content")
         all_cards: list[dict] = []
         total_chunks = sum(
-            len(chunk(items, deck_name, unit_name=unit_name))
+            len(chunk(items, deck_name, unit_name=unit_name, chunk_size=chunk_size, overlap=overlap))
             for _, items in chapters
         )
         chunk_count = 0
@@ -76,10 +79,13 @@ def process_file(
         ) as progress:
             task = progress.add_task("Generating cards...", total=total_chunks)
             for chapter_name, items in chapters:
-                chunks_list = chunk(items, deck_name, unit_name=unit_name)
+                chunks_list = chunk(items, deck_name, unit_name=unit_name, chunk_size=chunk_size, overlap=overlap)
                 if not chunks_list:
                     continue
                 for i, (chunk_text, first_idx, last_idx) in enumerate(chunks_list):
+                    if cancel_check and cancel_check():
+                        report("error", error="Cancelled")
+                        raise RuntimeError("Job cancelled") from None
                     chunk_count += 1
                     report("generating", f"Chunk {chunk_count}/{total_chunks}", current=chunk_count, total=total_chunks)
                     progress.update(task, description=f"Chunk {chunk_count}/{total_chunks}")
@@ -111,7 +117,7 @@ def process_file(
         if not all_cards:
             console.print("[yellow]No valid cards produced. Writing empty deck.[/yellow]")
 
-        report("exporting", "Building subdecks...")
+        report("exporting_subdecks", "Building subdecks...")
         decks = build_decks_by_chapter(all_cards, deck_name)
         out = output_path or Path(sanitize_deck_name(deck_name) + ".apkg")
         write_apkg_multi(decks, str(out))
@@ -130,7 +136,7 @@ def process_file(
         raise ValueError("No content")
 
     report("chunking", "Preparing content...")
-    chunks_list = chunk(items, deck_name, unit_name=unit_name)
+    chunks_list = chunk(items, deck_name, unit_name=unit_name, chunk_size=chunk_size, overlap=overlap)
     if not chunks_list:
         raise ValueError("No chunks")
 
@@ -144,6 +150,9 @@ def process_file(
     ) as progress:
         task = progress.add_task("Generating cards...", total=num_chunks)
         for i, (chunk_text, first_idx, last_idx) in enumerate(chunks_list):
+            if cancel_check and cancel_check():
+                report("error", error="Cancelled")
+                raise RuntimeError("Job cancelled") from None
             report("generating", f"Chunk {i + 1}/{num_chunks}", current=i + 1, total=num_chunks)
             progress.update(task, description=f"Chunk {i + 1}/{num_chunks}")
             raw = None
@@ -219,6 +228,20 @@ def main() -> int:
         action="store_true",
         help="Detect chapters in PPTX (sections/headings) and create subdecks (Deck::Chapter). Ignored for PDF.",
     )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=CHUNK_SIZE,
+        metavar="N",
+        help=f"Slides/pages per chunk (default: {CHUNK_SIZE})",
+    )
+    parser.add_argument(
+        "--overlap",
+        type=int,
+        default=CHUNK_OVERLAP,
+        metavar="N",
+        help=f"Overlap between consecutive chunks (default: {CHUNK_OVERLAP})",
+    )
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -241,6 +264,7 @@ def main() -> int:
             out, csv_out = process_file(
                 input_path, deck_name, out_path, args.provider,
                 output_csv_path=csv_path, use_chapters=args.chapters,
+                chunk_size=args.chunk_size, overlap=args.overlap,
             )
             console.print(f"[green]Done. Deck written to: {out}[/green]")
             if csv_out:
@@ -260,10 +284,18 @@ def main() -> int:
         prefix = (args.deck + " - ") if args.deck else ""
         for f in files:
             deck_name = prefix + f.stem
-            out, csv_out = process_file(f, deck_name, None, args.provider, use_chapters=args.chapters)
+            csv_path = Path(sanitize_deck_name(deck_name) + ".csv")
+            out, csv_out = process_file(
+                f, deck_name, None, args.provider,
+                output_csv_path=csv_path,
+                use_chapters=args.chapters,
+                chunk_size=args.chunk_size, overlap=args.overlap,
+            )
             console.print(f"[green]{f.name} -> {out}[/green]")
+            if csv_out:
+                console.print(f"[green]  CSV: {csv_out}[/green]")
         return 0
-    except (ValueError, RuntimeError, OSError) as e:
+    except (ValueError, RuntimeError, OSError, ParseError) as e:
         console.print(f"[red]{e}[/red]")
         return 1
 

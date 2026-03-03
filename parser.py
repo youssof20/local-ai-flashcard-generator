@@ -4,6 +4,15 @@ import json
 import re
 from difflib import SequenceMatcher
 
+
+class ParseError(Exception):
+    """Raised when the LLM output cannot be parsed as valid card JSON."""
+
+    def __init__(self, message: str, raw_preview: str = ""):
+        self.message = message
+        self.raw_preview = (raw_preview[:200] + "…") if len(raw_preview) > 200 else raw_preview
+        super().__init__(message)
+
 # Patterns that indicate administrative/syllabus content (not exam material). Case-insensitive.
 _ADMIN_PATTERNS = [
     r"\b(what is the )?name of the course\b",
@@ -71,8 +80,8 @@ def parse_cards(raw: str) -> list[dict]:
     raw = _strip_json_fences(raw)
     try:
         data = json.loads(raw)
-    except json.JSONDecodeError:
-        return []
+    except json.JSONDecodeError as e:
+        raise ParseError(f"Invalid JSON from LLM: {e}", raw) from e
 
     cards = data.get("cards") if isinstance(data, dict) else []
     if not isinstance(cards, list):
