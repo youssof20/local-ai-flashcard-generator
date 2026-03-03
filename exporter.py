@@ -155,26 +155,37 @@ def write_apkg_multi(decks: list[genanki.Deck], path: str) -> None:
     genanki.Package(decks).write_to_file(path)
 
 
+def _csv_sanitize(s: str) -> str:
+    """Replace Unicode that often corrupts in CSV import (em/en dash, smart quotes) with ASCII."""
+    if not s:
+        return s
+    s = s.replace("\u2014", " - ")  # em dash
+    s = s.replace("\u2013", "-")    # en dash
+    s = s.replace("\u201c", '"').replace("\u201d", '"')  # smart double quotes
+    s = s.replace("\u2018", "'").replace("\u2019", "'")  # smart single quotes
+    return s
+
+
 def write_csv(cards: list[dict], path: str) -> None:
     """
     Write cards to a CSV file for import into Knowt (or Quizlet).
     Knowt: Create set → Import manually → paste or upload; use comma between term/definition, newline between rows.
-    First row is header: Term,Definition
-    Basic cards: front = term, back = definition. Cloze: text (with {{c1::...}}) = term, "(cloze)" = definition.
+    First row is header: Term,Definition. Uses UTF-8 BOM so imports detect encoding; avoids em dashes/smart quotes.
+    Basic cards: front = term, back = definition. Cloze: text (with {{c1::...}}) = term, "(cloze - best viewed in Anki)" = definition.
     """
     import csv
     rows = [["Term", "Definition"]]
     for card in cards:
         ctype = (card.get("type") or "basic").lower()
         if ctype == "basic":
-            front = (card.get("front") or "").strip()
-            back = (card.get("back") or "").strip()
+            front = _csv_sanitize((card.get("front") or "").strip())
+            back = _csv_sanitize((card.get("back") or "").strip())
             if front or back:
                 rows.append([front, back])
         else:
-            text = (card.get("text") or "").strip()
+            text = _csv_sanitize((card.get("text") or "").strip())
             if text:
-                rows.append([text, "(cloze — best viewed in Anki)"])
-    with open(path, "w", newline="", encoding="utf-8") as f:
+                rows.append([text, "(cloze - best viewed in Anki)"])
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
         writer.writerows(rows)

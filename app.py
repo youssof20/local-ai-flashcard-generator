@@ -158,11 +158,16 @@ HTML = """<!DOCTYPE html>
       detailEl.textContent = message || '';
       if (total && total > 0 && current != null && phase === 'generating') {
         if (!etaStartTime) etaStartTime = Date.now();
-        const elapsed = (Date.now() - etaStartTime) / 1000;
-        const remaining = current > 0 ? (elapsed / current) * (total - current) : 0;
-        if (remaining > 60) etaEl.textContent = 'About ' + Math.ceil(remaining / 60) + ' min left';
-        else if (remaining > 5) etaEl.textContent = 'About ' + Math.ceil(remaining) + ' sec left';
-        else etaEl.textContent = '';
+        // Only show ETA after at least 2 chunks done (else estimate climbs then drops per chunk)
+        if (current >= 2) {
+          const elapsed = (Date.now() - etaStartTime) / 1000;
+          const remaining = (elapsed / current) * (total - current);
+          if (remaining > 60) etaEl.textContent = 'About ' + Math.ceil(remaining / 60) + ' min left';
+          else if (remaining > 5) etaEl.textContent = 'About ' + Math.ceil(remaining) + ' sec left';
+          else etaEl.textContent = '';
+        } else {
+          etaEl.textContent = '';
+        }
       } else if (phase === 'done' || phase === 'error') {
         etaEl.textContent = '';
         etaStartTime = null;
