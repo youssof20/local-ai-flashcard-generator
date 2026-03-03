@@ -94,11 +94,11 @@ def process_file(
                     last_error = None
                     for attempt in range(MAX_RETRIES):
                         try:
-            raw = generate(chunk_text, provider=provider, model=model)
-            break
-        except Exception as e:
-            last_error = e
-            if provider == "ollama" and "connection" in str(e).lower():
+                            raw = generate(chunk_text, provider=provider, model=model)
+                            break
+                        except Exception as e:
+                            last_error = e
+                            if provider == "ollama" and "connection" in str(e).lower():
                                 console.print("[red]Ollama is not running. Start it with: ollama serve[/red]")
                             if attempt < MAX_RETRIES - 1:
                                 progress.update(task, description=f"Chunk {chunk_count}/{total_chunks} (retry {attempt + 2})")
