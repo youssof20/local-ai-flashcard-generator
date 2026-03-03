@@ -113,9 +113,46 @@ def build_deck(
     return deck
 
 
+def _sanitize_deck_name_for_anki(name: str) -> str:
+    """Sanitize chapter/deck name for Anki subdeck (avoid :: in name part)."""
+    s = (name or "").strip()
+    s = re.sub(r'[<>:"/\\|?*]', "-", s)
+    return re.sub(r"\s+", " ", s) or "Section"
+
+
+def build_decks_by_chapter(
+    cards: list[dict],
+    base_deck_name: str,
+) -> list[genanki.Deck]:
+    """
+    Group cards by card['chapter'] and build one Deck per chapter.
+    Deck names are base_deck_name + "::" + chapter_name (Anki subdecks).
+    Cards without 'chapter' go into a deck named base_deck_name + "::Other".
+    Returns list of genanki.Deck for write_apkg_multi.
+    """
+    by_chapter: dict[str, list[dict]] = {}
+    for c in cards:
+        ch = (c.get("chapter") or "").strip()
+        if not ch:
+            ch = "Other"
+        ch = _sanitize_deck_name_for_anki(ch)
+        by_chapter.setdefault(ch, []).append(c)
+    decks: list[genanki.Deck] = []
+    for chapter_name, chapter_cards in by_chapter.items():
+        full_name = f"{base_deck_name}::{chapter_name}"
+        deck_id = abs(hash(full_name)) % (2**31)
+        decks.append(build_deck(chapter_cards, full_name, deck_id=deck_id))
+    return decks
+
+
 def write_apkg(deck: genanki.Deck, path: str) -> None:
-    """Write deck to a .apkg file."""
+    """Write a single deck to a .apkg file."""
     genanki.Package(deck).write_to_file(path)
+
+
+def write_apkg_multi(decks: list[genanki.Deck], path: str) -> None:
+    """Write multiple decks into one .apkg file (e.g. parent + subdecks)."""
+    genanki.Package(decks).write_to_file(path)
 
 
 def write_csv(cards: list[dict], path: str) -> None:

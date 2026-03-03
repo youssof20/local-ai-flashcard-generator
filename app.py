@@ -71,6 +71,11 @@ HTML = """<!DOCTYPE html>
     </select>
     <p class="hint" style="margin: -0.5rem 0 1rem 0; font-size: 0.85rem; color: #64748b;">Default: Ollama. Start the Ollama app first if you use it.</p>
 
+    <label style="display: flex; align-items: center; gap: 0.5rem; margin-bottom: 1rem;">
+      <input type="checkbox" id="useChapters" name="use_chapters" value="1">
+      <span>Use chapter detection (PPTX only: sections/headings → subdecks)</span>
+    </label>
+
     <button type="submit" id="submit">Generate deck</button>
   </form>
 
@@ -141,10 +146,12 @@ HTML = """<!DOCTYPE html>
       const fileInput = document.getElementById('file');
       const deck = document.getElementById('deck').value.trim() || fileInput.files[0].name.replace(/\\.(pptx|pdf)$/i, '');
       const provider = document.getElementById('provider').value;
+      const useChapters = document.getElementById('useChapters').checked;
       const formData = new FormData();
       formData.append('file', fileInput.files[0]);
       formData.append('deck', deck);
       formData.append('provider', provider);
+      formData.append('use_chapters', useChapters ? '1' : '0');
 
       submitBtn.disabled = true;
       progressEl.classList.remove('visible');
@@ -187,7 +194,7 @@ HTML = """<!DOCTYPE html>
 """
 
 
-def run_job(job_id: str, input_path: Path, deck_name: str, provider: str, out_path: Path, out_csv_path: Path):
+def run_job(job_id: str, input_path: Path, deck_name: str, provider: str, out_path: Path, out_csv_path: Path, use_chapters: bool = False):
     def callback(phase=None, message=None, current=None, total=None, error=None, **kwargs):
         with _jobs_lock:
             if job_id not in jobs:
@@ -205,6 +212,7 @@ def run_job(job_id: str, input_path: Path, deck_name: str, provider: str, out_pa
             input_path, deck_name, out_path, provider,
             progress_callback=callback,
             output_csv_path=out_csv_path,
+            use_chapters=use_chapters,
         )
         with _jobs_lock:
             if job_id in jobs:
@@ -237,6 +245,7 @@ def generate():
         return jsonify({"error": "Use a .pptx or .pdf file"}), 400
     deck_name = (request.form.get("deck") or "").strip() or Path(f.filename).stem
     provider = request.form.get("provider") or "ollama"
+    use_chapters = (request.form.get("use_chapters") or "").strip() == "1"
     if provider == "gemini" and not GEMINI_API_KEY:
         return jsonify({"error": "GEMINI_API_KEY not set. Use Ollama or set the key."}), 400
 
@@ -261,7 +270,7 @@ def generate():
             "error": None,
             "tmp": tmp,
         }
-    t = threading.Thread(target=run_job, args=(job_id, input_path, deck_name, provider, out_path, out_csv_path))
+    t = threading.Thread(target=run_job, args=(job_id, input_path, deck_name, provider, out_path, out_csv_path, use_chapters))
     t.daemon = True
     t.start()
     return jsonify({"job_id": job_id})

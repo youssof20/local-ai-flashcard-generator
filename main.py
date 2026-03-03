@@ -12,8 +12,8 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from chunker import chunk
 from config import GEMINI_API_KEY, MAX_RETRIES
-from exporter import build_deck, write_apkg, write_csv
-from extractor import extract
+from exporter import build_deck, build_decks_by_chapter, write_apkg, write_apkg_multi, write_csv
+from extractor import extract, extract_pptx_with_chapters
 from generator import generate
 from parser import parse_cards
 
@@ -41,17 +41,88 @@ def process_file(
     provider: str,
     progress_callback: Callable[..., None] | None = None,
     output_csv_path: Path | None = None,
+    use_chapters: bool = False,
 ) -> tuple[Path, Path | None]:
     """
     Extract, chunk, generate, parse, export for one file.
     progress_callback(phase, message=None, current=None, total=None) is called for UI updates.
     phase: "extracting" | "chunking" | "generating" | "exporting" | "done" | "error"
+    use_chapters: if True and file is PPTX, detect chapters and build subdecks (Deck::Chapter).
     Returns (apkg_path, csv_path or None).
     """
     def report(phase: str, message: str | None = None, current: int | None = None, total: int | None = None, error: str | None = None):
         if progress_callback:
             progress_callback(phase=phase, message=message, current=current, total=total, error=error)
 
+    is_pptx = input_path.suffix.lower() == ".pptx"
+    unit_name = get_unit_name(input_path)
+
+    if use_chapters and is_pptx:
+        report("extracting", "Reading slides and detecting chapters...")
+        chapters = extract_pptx_with_chapters(input_path)
+        if not chapters:
+            console.print(f"[yellow]No content from {input_path}. Skipping.[/yellow]")
+            raise ValueError("No content")
+        all_cards: list[dict] = []
+        total_chunks = sum(
+            len(chunk(items, deck_name, unit_name=unit_name))
+            for _, items in chapters
+        )
+        chunk_count = 0
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=console,
+        ) as progress:
+            task = progress.add_task("Generating cards...", total=total_chunks)
+            for chapter_name, items in chapters:
+                chunks_list = chunk(items, deck_name, unit_name=unit_name)
+                if not chunks_list:
+                    continue
+                for i, (chunk_text, first_idx, last_idx) in enumerate(chunks_list):
+                    chunk_count += 1
+                    report("generating", f"Chunk {chunk_count}/{total_chunks}", current=chunk_count, total=total_chunks)
+                    progress.update(task, description=f"Chunk {chunk_count}/{total_chunks}")
+                    raw = None
+                    last_error = None
+                    for attempt in range(MAX_RETRIES):
+                        try:
+                            raw = generate(chunk_text, provider=provider)
+                            break
+                        except Exception as e:
+                            last_error = e
+                            if provider == "ollama" and "connection" in str(e).lower():
+                                console.print("[red]Ollama is not running. Start it with: ollama serve[/red]")
+                            if attempt < MAX_RETRIES - 1:
+                                progress.update(task, description=f"Chunk {chunk_count}/{total_chunks} (retry {attempt + 2})")
+                    if raw is None:
+                        err_msg = str(last_error)
+                        report("error", error=err_msg)
+                        raise RuntimeError(f"Generation failed: {last_error}") from last_error
+                    cards = parse_cards(raw)
+                    source_label = f"Source: {unit_name.capitalize()}s {first_idx}–{last_idx}"
+                    for c in cards:
+                        c["chunk_index"] = chunk_count - 1
+                        c["source"] = source_label
+                        c["chapter"] = chapter_name
+                    all_cards.extend(cards)
+            progress.update(task, completed=total_chunks)
+
+        if not all_cards:
+            console.print("[yellow]No valid cards produced. Writing empty deck.[/yellow]")
+
+        report("exporting", "Building subdecks...")
+        decks = build_decks_by_chapter(all_cards, deck_name)
+        out = output_path or Path(sanitize_deck_name(deck_name) + ".apkg")
+        write_apkg_multi(decks, str(out))
+        csv_out = None
+        if output_csv_path is not None:
+            write_csv(all_cards, str(output_csv_path))
+            csv_out = output_csv_path
+        report("done", message=str(out))
+        return (out, csv_out)
+
+    # Flat flow (no chapters or PDF)
     report("extracting", "Reading slides...")
     items = extract(input_path)
     if not items:
@@ -59,12 +130,11 @@ def process_file(
         raise ValueError("No content")
 
     report("chunking", "Preparing content...")
-    unit_name = get_unit_name(input_path)
     chunks_list = chunk(items, deck_name, unit_name=unit_name)
     if not chunks_list:
         raise ValueError("No chunks")
 
-    all_cards: list[dict] = []
+    all_cards = []
     num_chunks = len(chunks_list)
 
     with Progress(
@@ -108,7 +178,7 @@ def process_file(
     deck = build_deck(all_cards, deck_name)
     out = output_path or Path(sanitize_deck_name(deck_name) + ".apkg")
     write_apkg(deck, str(out))
-    csv_out: Path | None = None
+    csv_out = None
     if output_csv_path is not None:
         write_csv(all_cards, str(output_csv_path))
         csv_out = output_csv_path
@@ -144,6 +214,11 @@ def main() -> int:
         default="ollama",
         help="LLM provider: ollama (local, free) or gemini (requires GEMINI_API_KEY)",
     )
+    parser.add_argument(
+        "--chapters",
+        action="store_true",
+        help="Detect chapters in PPTX (sections/headings) and create subdecks (Deck::Chapter). Ignored for PDF.",
+    )
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -163,7 +238,10 @@ def main() -> int:
             deck_name = args.deck or input_path.stem
             out_path = Path(args.output) if args.output else None
             csv_path = out_path.with_suffix(".csv") if out_path else Path(sanitize_deck_name(deck_name) + ".csv")
-            out, csv_out = process_file(input_path, deck_name, out_path, args.provider, output_csv_path=csv_path)
+            out, csv_out = process_file(
+                input_path, deck_name, out_path, args.provider,
+                output_csv_path=csv_path, use_chapters=args.chapters,
+            )
             console.print(f"[green]Done. Deck written to: {out}[/green]")
             if csv_out:
                 console.print(f"[green]Knowt/Quizlet CSV: {csv_out}[/green]")
@@ -182,7 +260,7 @@ def main() -> int:
         prefix = (args.deck + " - ") if args.deck else ""
         for f in files:
             deck_name = prefix + f.stem
-            out, csv_out = process_file(f, deck_name, None, args.provider)
+            out, csv_out = process_file(f, deck_name, None, args.provider, use_chapters=args.chapters)
             console.print(f"[green]{f.name} -> {out}[/green]")
         return 0
     except (ValueError, RuntimeError, OSError) as e:
